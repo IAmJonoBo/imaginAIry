@@ -66,16 +66,16 @@ requirements:  ## Freeze the requirements.txt file
 
 require_pyenv:
 	@if ! [ -x "$$(command -v pyenv)" ]; then\
-	  echo -e '\n\033[0;31m ❌ pyenv is not installed.  Follow instructions here: $(pyenv_instructions)\n\033[0m';\
-	  exit 1;\
+		echo -e '\n\033[0;31m ❌ pyenv is not installed.  Follow instructions here: $(pyenv_instructions)\n\033[0m';\
+		exit 1;\
 	else\
-	  echo -e "\033[0;32m ✔️  pyenv installed\033[0m";\
+		echo -e "\033[0;32m ✔️  pyenv installed\033[0m";\
 	fi
 	@if ! [[ "$$(pyenv virtualenv --version)" == *"pyenv-virtualenv"* ]]; then\
-	  echo -e '\n\033[0;31m ❌ pyenv virtualenv is not installed.  Follow instructions here: $(pyenv_virt_instructions) \n\033[0m';\
-	  exit 1;\
+		echo -e '\n\033[0;31m ❌ pyenv virtualenv is not installed.  Follow instructions here: $(pyenv_virt_instructions) \n\033[0m';\
+		exit 1;\
 	else\
-	  echo -e "\033[0;32m ✔️  pyenv-virtualenv installed\033[0m";\
+		echo -e "\033[0;32m ✔️  pyenv-virtualenv installed\033[0m";\
 	fi
 
 vendor_openai_clip:
@@ -129,7 +129,7 @@ vendorize_kdiffusion:
 	# without this most of the k-diffusion samplers didn't work
 	sed -i '' -e 's#return (x - denoised) / utils.append_dims(sigma, x.ndim)#return (x - denoised) / sigma#g' imaginairy/vendored/k_diffusion/sampling.py
 	sed -i '' -e 's#torch.randn_like(x)#torch.randn_like(x, device="cpu").to(x.device)#g' imaginairy/vendored/k_diffusion/sampling.py
- 	# https://github.com/AUTOMATIC1111/stable-diffusion-webui/issues/4558#issuecomment-1310387114
+		# https://github.com/AUTOMATIC1111/stable-diffusion-webui/issues/4558#issuecomment-1310387114
 	sed -i '' -e 's#t_fn = lambda sigma: sigma.log().neg()#t_fn = lambda sigma: sigma.to("cpu").log().neg().to(x.device)#g' imaginairy/vendored/k_diffusion/sampling.py
 	sed -i '' -e 's#return (x - denoised) / sigma#return ((x - denoised) / sigma.to("cpu")).to(x.device)#g' imaginairy/vendored/k_diffusion/sampling.py
 	sed -i '' -e 's#return t.neg().exp()#return t.to("cpu").neg().exp().to(self.model.device)#g' imaginairy/vendored/k_diffusion/sampling.py
