@@ -1,9 +1,7 @@
 import logging
-import math
 import os
 import re
 
-from imaginairy.enhancers.upscale_riverwing import upscale_latent
 from imaginairy.schema import SafetyMode
 
 logger = logging.getLogger(__name__)
@@ -208,6 +206,7 @@ def _generate_single_image(
     from imaginairy.enhancers.face_restoration_codeformer import enhance_faces
     from imaginairy.enhancers.upscale_realesrgan import upscale_image
     from imaginairy.img_utils import (
+        add_caption_to_image,
         pillow_fit_image_within,
         pillow_img_to_torch_image,
         pillow_mask_to_latent_mask,
@@ -219,12 +218,14 @@ def _generate_single_image(
         log_img,
         log_latent,
     )
-    from imaginairy.model_manager import get_diffusion_model
+    from imaginairy.model_manager import (
+        get_diffusion_model,
+        get_model_default_image_size,
+    )
     from imaginairy.modules.midas.api import torch_image_to_depth_map
     from imaginairy.outpaint import outpaint_arg_str_parse, prepare_image_for_outpaint
     from imaginairy.safety import create_safety_score
     from imaginairy.samplers import SAMPLER_LOOKUP
-    from imaginairy.samplers.base import NoiseSchedule, noise_an_image
     from imaginairy.samplers.editing import CFGEditingDenoiser
     from imaginairy.schema import ImaginePrompt, ImagineResult
     from imaginairy.utils import get_device, randn_seeded
@@ -244,10 +245,13 @@ def _generate_single_image(
     model = get_diffusion_model(
         weights_location=prompt.model,
         config_path=prompt.model_config_path,
+        control_weights_location=prompt.control_mode,
         half_mode=half_mode,
         for_inpainting=(prompt.mask_image or prompt.mask_prompt or prompt.outpaint)
         and not suppress_inpaint,
     )
+    is_controlnet_model = hasattr(model, "control_key")
+
     progress_latents = []
 
     def latent_logger(latents):
@@ -287,7 +291,7 @@ def _generate_single_image(
         SamplerCls = SAMPLER_LOOKUP[prompt.sampler_type.lower()]
         sampler = SamplerCls(model)
         mask_latent = mask_image = mask_image_orig = mask_grayscale = None
-        t_enc = init_latent = init_latent_noised = None
+        t_enc = init_latent = control_image = None
         starting_image = None
         denoiser_cls = None
 
@@ -300,8 +304,9 @@ def _generate_single_image(
         if prompt.init_image:
             starting_image = prompt.init_image
             generation_strength = 1 - prompt.init_image_strength
-            if model.cond_stage_key == "edit":
-                t_enc = prompt.steps
+
+            if model.cond_stage_key == "edit" or generation_strength >= 1:
+                t_enc = None
             else:
                 t_enc = int(prompt.steps * generation_strength)
 
@@ -356,63 +361,107 @@ def _generate_single_image(
             )
             # noise = noise[:, :, : init_latent.shape[2], : init_latent.shape[3]]
 
-            schedule = NoiseSchedule(
-                model_num_timesteps=model.num_timesteps,
-                ddim_num_steps=prompt.steps,
-                model_alphas_cumprod=model.alphas_cumprod,
-                ddim_discretize="uniform",
+            # schedule = NoiseSchedule(
+            #     model_num_timesteps=model.num_timesteps,
+            #     ddim_num_steps=prompt.steps,
+            #     model_alphas_cumprod=model.alphas_cumprod,
+            #     ddim_discretize="uniform",
+            # )
+            # if generation_strength >= 1:
+            #     # prompt strength gets converted to time encodings,
+            #     # which means you can't get to true 0 without this hack
+            #     # (or setting steps=1000)
+            #     init_latent_noised = noise
+            # else:
+            #     init_latent_noised = noise_an_image(
+            #         init_latent,
+            #         torch.tensor([t_enc - 1]).to(get_device()),
+            #         schedule=schedule,
+            #         noise=noise,
+            #     )
+
+        if hasattr(model, "depth_stage_key"):
+            # depth model
+            depth_t = torch_image_to_depth_map(init_image_t)
+            depth_latent = torch.nn.functional.interpolate(
+                depth_t,
+                size=shape[2:],
+                mode="bicubic",
+                align_corners=False,
             )
-            if generation_strength >= 1:
-                # prompt strength gets converted to time encodings,
-                # which means you can't get to true 0 without this hack
-                # (or setting steps=1000)
-                init_latent_noised = noise
+            result_images["depth_image"] = depth_t
+            c_cat.append(depth_latent)
+
+        elif is_controlnet_model:
+            from imaginairy.img_processors.control_modes import CONTROL_MODES
+
+            if prompt.control_image_raw is not None:
+                control_image = prompt.control_image_raw
+            elif prompt.control_image is not None:
+                control_image = prompt.control_image
+            control_image = control_image.convert("RGB")
+            log_img(control_image, "control_image_input")
+            control_image_input = pillow_fit_image_within(
+                control_image,
+                max_height=prompt.height,
+                max_width=prompt.width,
+            )
+            control_image_input_t = pillow_img_to_torch_image(control_image_input)
+            control_image_input_t = control_image_input_t.to(get_device())
+
+            if prompt.control_image_raw is None:
+                control_image_t = CONTROL_MODES[prompt.control_mode](
+                    control_image_input_t
+                )
             else:
-                init_latent_noised = noise_an_image(
-                    init_latent,
-                    torch.tensor([t_enc - 1]).to(get_device()),
-                    schedule=schedule,
-                    noise=noise,
+                control_image_t = (control_image_input_t + 1) / 2
+
+            control_image_disp = control_image_t * 2 - 1
+            result_images["control"] = control_image_disp[:, [2, 0, 1], :, :]
+            log_img(control_image_disp, "control_image")
+
+            if len(control_image_t.shape) == 3:
+                raise RuntimeError("Control image must be 4D")
+
+            if control_image_t.shape[1] != 3:
+                raise RuntimeError("Control image must have 3 channels")
+
+            if control_image_t.min() < 0 or control_image_t.max() > 1:
+                raise RuntimeError(
+                    f"Control image must be in [0, 1] but we received {control_image_t.min()} and {control_image_t.max()}"
                 )
 
-            if hasattr(model, "depth_stage_key"):
-                # depth model
-                depth_t = torch_image_to_depth_map(init_image_t)
-                depth_latent = torch.nn.functional.interpolate(
-                    depth_t,
-                    size=shape[2:],
-                    mode="bicubic",
-                    align_corners=False,
-                )
-                result_images["depth_image"] = depth_t
-                c_cat.append(depth_latent)
+            if control_image_t.max() == control_image_t.min():
+                raise RuntimeError("No control signal found in control image.")
 
-            elif hasattr(model, "masked_image_key"):
-                # inpainting model
-                mask_t = pillow_img_to_torch_image(ImageOps.invert(mask_image_orig)).to(
-                    get_device()
-                )
-                inverted_mask = 1 - mask_latent
-                masked_image_t = init_image_t * (mask_t < 0.5)
-                log_img(masked_image_t, "masked_image")
+            c_cat.append(control_image_t)
 
-                inverted_mask_latent = torch.nn.functional.interpolate(
-                    inverted_mask, size=shape[-2:]
-                )
-                c_cat.append(inverted_mask_latent)
+        elif hasattr(model, "masked_image_key"):
+            # inpainting model
+            mask_t = pillow_img_to_torch_image(ImageOps.invert(mask_image_orig)).to(
+                get_device()
+            )
+            inverted_mask = 1 - mask_latent
+            masked_image_t = init_image_t * (mask_t < 0.5)
+            log_img(masked_image_t, "masked_image")
 
-                masked_image_latent = model.get_first_stage_encoding(
-                    model.encode_first_stage(masked_image_t)
-                )
-                c_cat.append(masked_image_latent)
+            inverted_mask_latent = torch.nn.functional.interpolate(
+                inverted_mask, size=shape[-2:]
+            )
+            c_cat.append(inverted_mask_latent)
 
-            elif model.cond_stage_key == "edit":
-                # pix2pix model
-                c_cat = [model.encode_first_stage(init_image_t)]
-                c_cat_neutral = [torch.zeros_like(init_latent)]
-                denoiser_cls = CFGEditingDenoiser
-            if c_cat:
-                c_cat = [torch.cat(c_cat, dim=1)]
+            masked_image_latent = model.get_first_stage_encoding(
+                model.encode_first_stage(masked_image_t)
+            )
+            c_cat.append(masked_image_latent)
+
+        elif model.cond_stage_key == "edit":
+            # pix2pix model
+            c_cat = [model.encode_first_stage(init_image_t)]
+            c_cat_neutral = [torch.zeros_like(init_latent)]
+            denoiser_cls = CFGEditingDenoiser
+        if c_cat:
+            c_cat = [torch.cat(c_cat, dim=1)]
 
         if c_cat_neutral is None:
             c_cat_neutral = c_cat
@@ -425,49 +474,39 @@ def _generate_single_image(
             "c_concat": c_cat_neutral,
             "c_crossattn": [neutral_conditioning],
         }
-        log_latent(init_latent_noised, "init_latent_noised")
 
-        if prompt.allow_compose_phase:
-            comp_samples = _generate_composition_latent(
-                sampler=sampler,
-                sampler_kwargs={
-                    "num_steps": prompt.steps,
-                    "initial_latent": init_latent_noised,
-                    "positive_conditioning": positive_conditioning,
-                    "neutral_conditioning": neutral_conditioning,
-                    "guidance_scale": prompt.prompt_strength,
-                    "t_start": t_enc,
-                    "mask": mask_latent,
-                    "orig_latent": init_latent,
-                    "shape": shape,
-                    "batch_size": 1,
-                    "denoiser_cls": denoiser_cls,
-                },
-            )
-            if comp_samples is not None:
-                result_images["composition"] = comp_samples
-                noise = noise[:, :, : comp_samples.shape[2], : comp_samples.shape[3]]
-
-                schedule = NoiseSchedule(
-                    model_num_timesteps=model.num_timesteps,
-                    ddim_num_steps=prompt.steps,
-                    model_alphas_cumprod=model.alphas_cumprod,
-                    ddim_discretize="uniform",
+        if (
+            prompt.allow_compose_phase
+            and not is_controlnet_model
+            and not model.cond_stage_key == "edit"
+        ):
+            if prompt.init_image:
+                comp_image = _generate_composition_image(
+                    prompt=prompt,
+                    target_height=init_image.height,
+                    target_width=init_image.width,
+                    cutoff=get_model_default_image_size(prompt.model),
                 )
-                t_enc = int(prompt.steps * 0.75)
-                init_latent_noised = noise_an_image(
-                    comp_samples,
-                    torch.tensor([t_enc - 1]).to(get_device()),
-                    schedule=schedule,
-                    noise=noise,
+            else:
+                comp_image = _generate_composition_image(
+                    prompt=prompt,
+                    target_height=prompt.height,
+                    target_width=prompt.width,
+                    cutoff=get_model_default_image_size(prompt.model),
                 )
-
-                log_latent(comp_samples, "comp_samples")
-
+            if comp_image is not None:
+                result_images["composition"] = comp_image
+                # noise = noise[:, :, : comp_image.height, : comp_image.shape[3]]
+                t_enc = int(prompt.steps * 0.65)
+                log_img(comp_image, "comp_image")
+                comp_image_t = pillow_img_to_torch_image(comp_image)
+                comp_image_t = comp_image_t.to(get_device())
+                init_latent = model.get_first_stage_encoding(
+                    model.encode_first_stage(comp_image_t)
+                )
         with lc.timing("sampling"):
             samples = sampler.sample(
                 num_steps=prompt.steps,
-                initial_latent=init_latent_noised,
                 positive_conditioning=positive_conditioning,
                 neutral_conditioning=neutral_conditioning,
                 guidance_scale=prompt.prompt_strength,
@@ -477,6 +516,7 @@ def _generate_single_image(
                 shape=shape,
                 batch_size=1,
                 denoiser_cls=denoiser_cls,
+                noise=noise,
             )
         if return_latent:
             return samples
@@ -530,6 +570,9 @@ def _generate_single_image(
                     mask_img=mask_image_orig,
                 )
 
+            if prompt.caption_text:
+                add_caption_to_image(gen_img, prompt.caption_text)
+
         result = ImagineResult(
             img=gen_img,
             prompt=prompt,
@@ -572,65 +615,64 @@ def calc_scale_to_fit_within(
     return max_size / height
 
 
-def _generate_composition_latent(
-    sampler,
-    sampler_kwargs,
+def _scale_latent(
+    latent,
+    model,
+    h,
+    w,
 ):
-    from copy import deepcopy
-
     from torch.nn import functional as F
 
-    b, c, h, w = orig_shape = sampler_kwargs["shape"]
-    max_compose_gen_size = 768
-    shrink_scale = calc_scale_to_fit_within(
-        height=h,
-        width=w,
-        max_size=int(math.ceil(max_compose_gen_size / 8)),
-    )
-    if shrink_scale >= 1:
+    # convert to non-latent-space first
+    img = model.decode_first_stage(latent)
+    img = F.interpolate(img, size=(h, w), mode="bicubic", align_corners=False)
+    latent = model.get_first_stage_encoding(model.encode_first_stage(img))
+    return latent
+
+
+def _generate_composition_image(prompt, target_height, target_width, cutoff=512):
+    from copy import copy
+
+    from PIL import Image
+
+    if prompt.width <= cutoff and prompt.height <= cutoff:
         return None
 
-    new_kwargs = deepcopy(sampler_kwargs)
-
-    # shrink everything
-    new_shape = b, c, int(round(h * shrink_scale)), int(round(w * shrink_scale))
-    initial_latent = new_kwargs["initial_latent"]
-    if initial_latent is not None:
-        initial_latent = F.interpolate(initial_latent, size=new_shape[2:], mode="area")
-
-    for cond in [
-        new_kwargs["positive_conditioning"],
-        new_kwargs["neutral_conditioning"],
-    ]:
-        cond["c_concat"] = [
-            F.interpolate(c, size=new_shape[2:], mode="area") for c in cond["c_concat"]
-        ]
-
-    mask_latent = new_kwargs["mask"]
-    if mask_latent is not None:
-        mask_latent = F.interpolate(mask_latent, size=new_shape[2:], mode="area")
-
-    orig_latent = new_kwargs["orig_latent"]
-    if orig_latent is not None:
-        orig_latent = F.interpolate(orig_latent, size=new_shape[2:], mode="area")
-    t_start = new_kwargs["t_start"]
-    if t_start is not None:
-        gen_strength = new_kwargs["t_start"] / new_kwargs["num_steps"]
-        t_start = int(round(15 * gen_strength))
-    new_kwargs.update(
-        {
-            "num_steps": 15,
-            "initial_latent": initial_latent,
-            "t_start": t_start,
-            "mask": mask_latent,
-            "orig_latent": orig_latent,
-            "shape": new_shape,
-        }
+    composition_prompt = copy(prompt)
+    shrink_scale = calc_scale_to_fit_within(
+        height=prompt.height,
+        width=prompt.width,
+        max_size=cutoff,
     )
-    samples = sampler.sample(**new_kwargs)
-    samples = upscale_latent(samples)
-    samples = F.interpolate(samples, size=orig_shape[2:], mode="bilinear")
-    return samples
+    composition_prompt.width = int(prompt.width * shrink_scale)
+    composition_prompt.height = int(prompt.height * shrink_scale)
+
+    composition_prompt.steps = None
+    composition_prompt.upscaled = False
+    composition_prompt.fix_faces = False
+    composition_prompt.mask_modify_original = False
+
+    composition_prompt.validate()
+
+    result = _generate_single_image(composition_prompt)
+    img = result.images["generated"]
+    while img.width < target_width:
+        from imaginairy.enhancers.upscale_realesrgan import upscale_image
+
+        img = upscale_image(img)
+
+    # samples = _generate_single_image(composition_prompt, return_latent=True)
+    # while samples.shape[-1] * 8 < target_width:
+    #     samples = upscale_latent(samples)
+    #
+    # img = model_latent_to_pillow_img(samples)
+
+    img = img.resize(
+        (target_width, target_height),
+        resample=Image.Resampling.LANCZOS,
+    )
+
+    return img
 
 
 def prompt_normalized(prompt):

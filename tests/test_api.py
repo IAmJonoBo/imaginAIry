@@ -4,6 +4,7 @@ import pytest
 
 from imaginairy import LazyLoadingImage
 from imaginairy.api import imagine, imagine_image_files
+from imaginairy.img_processors.control_modes import CONTROL_MODES
 from imaginairy.img_utils import pillow_fit_image_within
 from imaginairy.schema import ImaginePrompt
 from imaginairy.utils import get_device
@@ -126,6 +127,40 @@ def test_img_to_img_from_url_cats(
     img.save(f"{filename_base_for_orig_outputs}__orig.jpg")
     img_path = f"{filename_base_for_outputs}.png"
     assert_image_similar_to_expectation(result.img, img_path=img_path, threshold=17000)
+
+
+def test_img2img_low_noise(
+    filename_base_for_outputs,
+    sampler_type,
+):
+    fruit_path = os.path.join(TESTS_FOLDER, "data", "bowl_of_fruit.jpg")
+    img = LazyLoadingImage(filepath=fruit_path)
+
+    prompt = ImaginePrompt(
+        "a white bowl filled with gold coins",
+        prompt_strength=12,
+        init_image=img,
+        init_image_strength=0.5,
+        mask_prompt="(fruit{*2} OR stem{*10} OR fruit stem{*3})",
+        mask_mode="replace",
+        # steps=40,
+        seed=1,
+        sampler_type=sampler_type,
+    )
+
+    result = next(imagine(prompt))
+
+    threshold_lookup = {
+        "k_dpm_2_a": 26000,
+        "k_euler_a": 18000,
+        "k_dpm_adaptive": 13000,
+    }
+    threshold = threshold_lookup.get(sampler_type, 14000)
+
+    img_path = f"{filename_base_for_outputs}.png"
+    assert_image_similar_to_expectation(
+        result.img, img_path=img_path, threshold=threshold
+    )
 
 
 @pytest.mark.parametrize("init_strength", [0, 0.05, 0.2, 1])
@@ -257,7 +292,7 @@ def test_cliptext_inpainting_pearl_doctor(
 
     pillow_fit_image_within(img).save(f"{filename_base_for_orig_outputs}_orig.jpg")
     img_path = f"{filename_base_for_outputs}.png"
-    assert_image_similar_to_expectation(result.img, img_path=img_path, threshold=12000)
+    assert_image_similar_to_expectation(result.img, img_path=img_path, threshold=32000)
 
 
 @pytest.mark.skipif(get_device() == "cpu", reason="Too slow to run on CPU")
@@ -270,6 +305,45 @@ def test_tile_mode(filename_base_for_outputs):
         steps=15,
         seed=1,
         tile_mode="xy",
+    )
+    result = next(imagine(prompt))
+
+    img_path = f"{filename_base_for_outputs}.png"
+    assert_image_similar_to_expectation(result.img, img_path=img_path, threshold=25000)
+
+
+control_modes = list(CONTROL_MODES.keys())
+
+
+@pytest.mark.parametrize("control_mode", control_modes)
+@pytest.mark.skipif(get_device() == "cpu", reason="Too slow to run on CPU")
+def test_controlnet(filename_base_for_outputs, control_mode):
+    prompt_text = "a photo of a woman sitting on a bench"
+    prompt = ImaginePrompt(
+        prompt_text,
+        control_image=LazyLoadingImage(filepath=f"{TESTS_FOLDER}/data/bench2.png"),
+        width=512,
+        height=512,
+        steps=15,
+        seed=0,
+        control_mode=control_mode,
+        fix_faces=True,
+    )
+    result = next(imagine(prompt))
+
+    img_path = f"{filename_base_for_outputs}.png"
+    assert_image_similar_to_expectation(result.img, img_path=img_path, threshold=24000)
+
+
+@pytest.mark.skipif(get_device() == "cpu", reason="Too slow to run on CPU")
+def test_large_image(filename_base_for_outputs):
+    prompt_text = "a stormy ocean. oil painting"
+    prompt = ImaginePrompt(
+        prompt_text,
+        width=1920,
+        height=1080,
+        steps=15,
+        seed=0,
     )
     result = next(imagine(prompt))
 
